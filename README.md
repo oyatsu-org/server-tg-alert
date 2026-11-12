@@ -5,7 +5,7 @@ Get a Telegram message when your VPS:
 - 🟢 starts (⚠️ also warns if the last shutdown was a crash or power loss)
 - 🔴 shuts down / 🔄 reboots
 - ✅ gets a successful SSH or console login
-- ❌ gets failed SSH logins (grouped into one message every 5 min)
+- ❌ gets a failed SSH login (instantly, or as a summary every 5 min - you choose)
 
 ## Install (one command, on any new VPS)
 
@@ -35,7 +35,8 @@ Edit `/etc/tg-alert.conf`, then run `sudo systemctl restart tg-alert-failwatch`.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `FAIL_BATCH_SECONDS` | 300 | Group failed logins into one message every N seconds. `0` = one message per failed connection (noisy). |
+| `FAIL_BATCH_SECONDS` | 0 | `0` = instant message for every failed login. `300` = one summary every 5 min. |
+| `FAIL_INSTANT_MAX` | 20 | Instant mode: max messages per minute. Extra failures (e.g. a brute-force attack) arrive as one summary. |
 | `NOTIFY_LOGOUT` | 0 | `1` = also alert on logout |
 | `IGNORE_LOGIN_IPS` | empty | Your own IPs that shouldn't trigger login alerts |
 | `SERVER_NAME` | hostname | Name shown in each message |

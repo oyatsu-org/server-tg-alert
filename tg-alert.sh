@@ -14,6 +14,7 @@ set -euo pipefail
 
 CONF=/etc/tg-alert.conf
 ENV_SERVER_NAME="${SERVER_NAME:-}"   # set when passed as SERVER_NAME=... on the command line
+ENV_FAIL_BATCH="${FAIL_BATCH_SECONDS:-}"
 BIN=/usr/local/bin
 STATE=/var/lib/tg-alert
 UNITS=/etc/systemd/system
@@ -153,25 +154,22 @@ EOF_LOGIN
 
 cat > "$BIN/tg-alert-failwatch" <<'EOF_FAIL'
 #!/usr/bin/env bash
-# Watches sshd logs for failed logins; groups them every FAIL_BATCH_SECONDS (0 = instant).
+# Watches sshd logs for failed logins.
+#   FAIL_BATCH_SECONDS=0   -> instant: one message per failed connection, right away
+#                             (max FAIL_INSTANT_MAX per minute; the rest come as one summary)
+#   FAIL_BATCH_SECONDS=300 -> one summary message every 5 minutes
 . /etc/tg-alert.conf
-BATCH=${FAIL_BATCH_SECONDS:-300}
-declare -A CONN_IP IP_COUNT IP_USERS
+BATCH=${FAIL_BATCH_SECONDS:-0}
+MAX=${FAIL_INSTANT_MAX:-20}
+declare -A SEEN CONN_IP IP_COUNT IP_USERS
 total=0
 last_flush=$(date +%s)
+win_sent=0
 
-record() {  # pid user ip
+now() { date '+%Y-%m-%d %H:%M:%S %Z'; }
+
+add_to_summary() {  # pid user ip
     local pid=$1 user=$2 ip=$3
-    if [ "$BATCH" -eq 0 ]; then
-        [ -n "${CONN_IP[$pid]}" ] && return
-        CONN_IP[$pid]=$ip
-        [ "${#CONN_IP[@]}" -gt 1000 ] && CONN_IP=()
-        /usr/local/bin/tg-alert-send "❌ FAILED LOGIN
-User: $user
-From: $ip
-Time: $(date '+%Y-%m-%d %H:%M:%S %Z')" &
-        return
-    fi
     if [ -z "${CONN_IP[$pid]}" ]; then
         CONN_IP[$pid]=$ip
         IP_COUNT[$ip]=$(( ${IP_COUNT[$ip]:-0} + 1 ))
@@ -183,12 +181,38 @@ Time: $(date '+%Y-%m-%d %H:%M:%S %Z')" &
     esac
 }
 
+record() {  # pid user ip reason
+    local pid=$1 user=$2 ip=$3 reason=$4
+    if [ "$BATCH" -gt 0 ]; then add_to_summary "$pid" "$user" "$ip"; return; fi
+
+    # instant mode: one alert per connection
+    [ -n "${SEEN[$pid]}" ] && return
+    SEEN[$pid]=1
+    [ "${#SEEN[@]}" -gt 2000 ] && SEEN=()
+    if [ "$win_sent" -lt "$MAX" ]; then
+        win_sent=$((win_sent + 1))
+        /usr/local/bin/tg-alert-send "❌ FAILED LOGIN
+User: $user
+From: $ip
+Reason: $reason
+Time: $(now)" &
+    else
+        add_to_summary "$pid" "$user" "$ip"   # flood: collect, send as one message
+    fi
+}
+
 flush() {
     last_flush=$(date +%s)
+    win_sent=0
     [ "$total" -gt 0 ] || return
-    local period lines ip users msg cnt
-    if [ "$BATCH" -ge 60 ]; then period="$((BATCH / 60)) min"; else period="${BATCH}s"; fi
-    msg="❌ $total FAILED SSH LOGIN attempt(s) in the last $period"
+    local lines ip users msg cnt
+    if [ "$BATCH" -gt 0 ]; then
+        if [ "$BATCH" -ge 60 ]; then msg="❌ $total FAILED SSH LOGIN attempt(s) in the last $((BATCH / 60)) min"
+        else msg="❌ $total FAILED SSH LOGIN attempt(s) in the last ${BATCH}s"; fi
+    else
+        msg="❌ +$total MORE FAILED SSH LOGIN attempt(s) in the last minute
+(too many to send one by one - likely a brute-force attack)"
+    fi
     lines=$(for ip in "${!IP_COUNT[@]}"; do echo "${IP_COUNT[$ip]} $ip"; done | sort -rn | head -15)
     while read -r cnt ip; do
         users=${IP_USERS[$ip]}
@@ -202,23 +226,32 @@ flush() {
     CONN_IP=(); IP_COUNT=(); IP_USERS=(); total=0
 }
 
+# instant mode: rate-limit window is 60s; summary mode: FAIL_BATCH_SECONDS
+PERIOD=$BATCH; [ "$PERIOD" -gt 0 ] || PERIOD=60
+
 journalctl -f -n0 -o short -t sshd -t sshd-session -t sshd-auth 2>/dev/null |
 while :; do
-    if IFS= read -r -t 5 line; then
+    if IFS= read -r -t 2 line; then
         pid=$(sed -nE 's/.*sshd(-session|-auth)?\[([0-9]+)\]:.*/\2/p' <<< "$line")
         [ -n "$pid" ] || pid=$RANDOM
-        if [[ $line =~ Failed\ [a-z/-]+\ for\ (invalid\ user\ )?(.*)\ from\ ([0-9a-fA-F.:]+)\ port ]]; then
-            record "$pid" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+        if [[ $line =~ Failed\ ([a-z/-]+)\ for\ (invalid\ user\ )?(.*)\ from\ ([0-9a-fA-F.:]+)\ port ]]; then
+            case "${BASH_REMATCH[1]}" in
+                password|keyboard-interactive/pam) reason="wrong password" ;;
+                publickey) reason="SSH key not accepted" ;;
+                *) reason="authentication failed (${BASH_REMATCH[1]})" ;;
+            esac
+            [ -n "${BASH_REMATCH[2]}" ] && reason="user does not exist"
+            record "$pid" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}" "$reason"
         elif [[ $line =~ Invalid\ user\ (.*)\ from\ ([0-9a-fA-F.:]+)\ port ]]; then
-            record "$pid" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+            record "$pid" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "user does not exist"
         elif [[ $line =~ Connection\ closed\ by\ authenticating\ user\ (.*)\ ([0-9a-fA-F.:]+)\ port\ [0-9]+\ \[preauth\] ]]; then
-            record "$pid" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+            record "$pid" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "no valid SSH key / gave up"
         fi
     elif [ $? -le 128 ]; then
         flush; wait
         exit 1
     fi
-    [ "$BATCH" -gt 0 ] && [ $(( $(date +%s) - last_flush )) -ge "$BATCH" ] && flush
+    [ $(( $(date +%s) - last_flush )) -ge "$PERIOD" ] && flush
 done
 EOF_FAIL
 
@@ -341,6 +374,21 @@ send_test() {
     return 1
 }
 
+get_fail_mode() {
+    # Given on the command line (FAIL_BATCH_SECONDS=... bash) -> don't ask
+    if [ -n "$ENV_FAIL_BATCH" ]; then FAIL_BATCH_SECONDS=$ENV_FAIL_BATCH; return; fi
+    local ans=""
+    if [ -r /dev/tty ]; then
+        echo
+        echo "Failed login alerts:"
+        echo "  Y = instant - a message for every failed login, right away (default)"
+        echo "  n = summary - one message every 5 minutes (quieter)"
+        ask ans "Send failed login alerts instantly? [Y/n] "
+    fi
+    if [[ $ans =~ ^[Nn] ]]; then FAIL_BATCH_SECONDS=300; c_ok "✔ Failed logins: summary every 5 min"
+    else FAIL_BATCH_SECONDS=0; c_ok "✔ Failed logins: instant"; fi
+}
+
 get_server_name() {
     # Given on the command line (SERVER_NAME=... bash) -> don't ask
     if [ -z "$ENV_SERVER_NAME" ]; then
@@ -365,8 +413,11 @@ CHAT_ID="$CHAT_ID"
 # Name shown in every message (empty = hostname)
 SERVER_NAME="${SERVER_NAME:-}"
 
-# Failed logins are grouped into one message every N seconds (0 = one message per failure)
-FAIL_BATCH_SECONDS=${FAIL_BATCH_SECONDS:-300}
+# Failed logins: 0 = instant message for each one, N = one summary every N seconds (e.g. 300)
+FAIL_BATCH_SECONDS=${FAIL_BATCH_SECONDS:-0}
+
+# Instant mode flood limit: max messages per minute; the rest are sent as one summary
+FAIL_INSTANT_MAX=${FAIL_INSTANT_MAX:-20}
 
 # 1 = also notify on logout
 NOTIFY_LOGOUT=${NOTIFY_LOGOUT:-0}
@@ -499,6 +550,7 @@ do_install() {
     get_token
     get_chat_id
     get_server_name
+    get_fail_mode
 
     # Test before saving anything; on failure ask for the chat again.
     until send_test; do
@@ -538,7 +590,7 @@ do_install() {
     cat <<EOF
 You will now get Telegram alerts for:
   🟢 server start   🔴 shutdown   🔄 reboot   ⚠️ crash / power loss
-  ✅ SSH / console login   ❌ failed SSH logins (grouped every 5 min)
+  ✅ SSH / console login   ❌ failed SSH logins
 
 Settings : $CONF
 Test     : tg-alert-send "hello"
