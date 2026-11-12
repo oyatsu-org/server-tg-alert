@@ -269,35 +269,58 @@ get_token() {
     done
 }
 
+valid_chat_id() { [[ $1 =~ ^-?[0-9]+$ || $1 =~ ^@[A-Za-z0-9_]{5,}$ ]]; }
+
 get_chat_id() {
-    [ -n "${CHAT_ID:-}" ] && return
+    if [ -n "${CHAT_ID:-}" ]; then
+        valid_chat_id "$CHAT_ID" && return
+        c_warn "Ignoring invalid CHAT_ID '$CHAT_ID' (must be a number like 987654321) - detecting it automatically."
+        CHAT_ID=""
+    fi
     echo
     echo "Now open https://t.me/$BOT_NAME in Telegram and press START (or send any message)."
     echo "Waiting for your message... (or type your chat ID and press Enter)"
-    # clear old updates so we pick up the new message
-    local offset=0 upd id
-    upd=$(tg_api getUpdates 2>/dev/null || true)
-    id=$(echo "$upd" | grep -o '"update_id":[0-9]*' | tail -1 | cut -d: -f2 || true)
-    [ -n "$id" ] && offset=$((id + 1))
 
-    local end=$(( $(date +%s) + 300 )) typed=""
+    local end=$(( $(date +%s) + 300 )) typed="" upd chat who id warned=""
     while [ "$(date +%s)" -lt "$end" ]; do
-        upd=$(tg_api "getUpdates?offset=$offset&timeout=0" 2>/dev/null || true)
-        CHAT_ID=$(echo "$upd" | grep -o '"chat":{"id":-\?[0-9]*' | tail -1 | grep -o -- '-\?[0-9]*$' || true)
+        upd=$(curl -sS --max-time 30 "https://api.telegram.org/bot${BOT_TOKEN}/getUpdates" 2>/dev/null || true)
+        if [ -z "$warned" ] && grep -q '"ok":false' <<<"$upd"; then
+            c_warn "Telegram: $(grep -o '"description":"[^"]*"' <<<"$upd" | cut -d'"' -f4 || true)"
+            c_warn "Type your chat ID manually instead."
+            warned=1
+        fi
+        # newest chat that wrote to the bot (messages already sent before this step count too)
+        chat=$(grep -o '"chat":{[^}]*}' <<<"$upd" | tail -1 || true)
+        CHAT_ID=$(grep -o '"id":-\?[0-9]*' <<<"$chat" | head -1 | cut -d: -f2 || true)
         if [ -n "$CHAT_ID" ]; then
-            c_ok "✔ Got chat ID: $CHAT_ID"
+            who=$(grep -o '"\(username\|first_name\|title\)":"[^"]*"' <<<"$chat" | head -1 | cut -d'"' -f4 || true)
+            c_ok "✔ Got chat ID: $CHAT_ID${who:+ ($who)}"
             # acknowledge so the message is not seen again
-            id=$(echo "$upd" | grep -o '"update_id":[0-9]*' | tail -1 | cut -d: -f2 || true)
+            id=$(grep -o '"update_id":[0-9]*' <<<"$upd" | tail -1 | cut -d: -f2 || true)
             [ -n "$id" ] && { tg_api "getUpdates?offset=$((id + 1))" >/dev/null 2>&1 || true; }
             return
         fi
         # let the user type an ID instead (3s window per loop)
         if [ -r /dev/tty ] && read -r -t 3 typed </dev/tty; then
             typed=$(echo "$typed" | tr -d '[:space:]')
-            if [[ $typed =~ ^-?[0-9]+$ ]]; then CHAT_ID=$typed; return; fi
+            if valid_chat_id "$typed"; then CHAT_ID=$typed; return; fi
+            [ -n "$typed" ] && c_err "'$typed' is not a valid chat ID (a number like 987654321)."
         fi
     done
     die "no message received in 5 minutes. Run the installer again."
+}
+
+send_test() {
+    echo "Sending test message..."
+    local resp
+    resp=$(curl -sS --max-time 20 "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+        --data-urlencode "chat_id=${CHAT_ID}" \
+        --data-urlencode "text=[${SERVER_NAME}]
+🔔 Telegram alerts installed on this server. This is a test message." 2>&1 || true)
+    grep -q '"ok":true' <<<"$resp" && return 0
+    TG_ERR=$(grep -o '"description":"[^"]*"' <<<"$resp" | cut -d'"' -f4 || true)
+    [ -n "$TG_ERR" ] || TG_ERR=$(head -c 200 <<<"$resp")
+    return 1
 }
 
 get_server_name() {
@@ -364,16 +387,20 @@ do_install() {
     get_token
     get_chat_id
     get_server_name
-    write_conf
 
+    # Test before saving anything; on failure ask for the chat again.
+    until send_test; do
+        c_err "Could not send to chat $CHAT_ID: ${TG_ERR:-no answer from Telegram}"
+        [ -r /dev/tty ] || die "fix BOT_TOKEN / CHAT_ID and run again."
+        echo "Make sure you pressed START in the chat with @$BOT_NAME."
+        CHAT_ID=""
+        get_chat_id
+    done
+    c_ok "✔ Test message sent - check Telegram"
+
+    write_conf
     mkdir -p "$BIN" "$STATE"
     write_files
-
-    echo "Sending test message..."
-    if ! RETRY_SECONDS=5 "$BIN/tg-alert-send" "🔔 Telegram alerts installed on this server. This is a test message."; then
-        die "could not send to chat $CHAT_ID. Did you press START in the bot chat?"
-    fi
-    c_ok "✔ Test message sent - check Telegram"
 
     # Successful logins (SSH + console) via PAM
     local f

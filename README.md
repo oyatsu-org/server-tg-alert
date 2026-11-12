@@ -20,6 +20,7 @@ your bot's chat. It finds your chat ID automatically, asks for a **server name**
 Don't have a bot yet? In Telegram, open **@BotFather**, send `/newbot`, and copy the token.
 
 ### Without any questions (for automation)
+Replace the three values with your own. Most people should use the command above instead.
 ```bash
 curl -fsSL https://raw.githubusercontent.com/oyatsu-org/server-tg-alert/main/tg-alert.sh | sudo BOT_TOKEN=123:ABC CHAT_ID=987654321 SERVER_NAME="My VPS" bash
 ```
