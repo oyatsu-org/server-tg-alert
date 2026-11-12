@@ -5,7 +5,7 @@
 #  Install:    curl -fsSL https://raw.githubusercontent.com/oyatsu-org/server-tg-alert/main/tg-alert.sh | sudo bash
 #  Uninstall:  curl -fsSL https://raw.githubusercontent.com/oyatsu-org/server-tg-alert/main/tg-alert.sh | sudo bash -s uninstall
 #  Non-interactive:
-#     curl -fsSL https://raw.githubusercontent.com/oyatsu-org/server-tg-alert/main/tg-alert.sh | sudo BOT_TOKEN=xxx CHAT_ID=yyy bash
+#     curl -fsSL https://raw.githubusercontent.com/oyatsu-org/server-tg-alert/main/tg-alert.sh | sudo BOT_TOKEN=xxx CHAT_ID=yyy SERVER_NAME="My VPS" bash
 #
 #  Alerts: server start / shutdown / reboot / unclean shutdown,
 #          successful SSH + console login, failed SSH logins.
@@ -13,6 +13,7 @@
 set -euo pipefail
 
 CONF=/etc/tg-alert.conf
+ENV_SERVER_NAME="${SERVER_NAME:-}"   # set when passed as SERVER_NAME=... on the command line
 BIN=/usr/local/bin
 STATE=/var/lib/tg-alert
 UNITS=/etc/systemd/system
@@ -299,6 +300,21 @@ get_chat_id() {
     die "no message received in 5 minutes. Run the installer again."
 }
 
+get_server_name() {
+    # Given on the command line (SERVER_NAME=... bash) -> don't ask
+    if [ -z "$ENV_SERVER_NAME" ]; then
+        local def="${SERVER_NAME:-$(hostname)}" n=""
+        if [ -r /dev/tty ]; then
+            echo
+            ask n "Server name shown in alerts [$def]: "
+        fi
+        SERVER_NAME="${n:-$def}"
+    fi
+    # strip characters that would break the config file
+    SERVER_NAME="$(printf '%s' "$SERVER_NAME" | tr -d '"$`\\')"
+    c_ok "✔ Server name: $SERVER_NAME"
+}
+
 write_conf() {
     cat > "$CONF" <<EOF
 # Telegram VPS alerts - settings  (after editing: systemctl restart tg-alert-failwatch)
@@ -347,6 +363,7 @@ do_install() {
 
     get_token
     get_chat_id
+    get_server_name
     write_conf
 
     mkdir -p "$BIN" "$STATE"

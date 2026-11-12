@@ -14,13 +14,14 @@ curl -fsSL https://raw.githubusercontent.com/oyatsu-org/server-tg-alert/main/tg-
 ```
 
 The installer asks for your **bot token**, then tells you to press **START** in
-your bot's chat. It finds your chat ID automatically and sends a test message.
+your bot's chat. It finds your chat ID automatically, asks for a **server name**
+(shown in every alert, press Enter to use the hostname), and sends a test message.
 
 Don't have a bot yet? In Telegram, open **@BotFather**, send `/newbot`, and copy the token.
 
 ### Without any questions (for automation)
 ```bash
-curl -fsSL https://raw.githubusercontent.com/oyatsu-org/server-tg-alert/main/tg-alert.sh | sudo BOT_TOKEN=123:ABC CHAT_ID=987654321 bash
+curl -fsSL https://raw.githubusercontent.com/oyatsu-org/server-tg-alert/main/tg-alert.sh | sudo BOT_TOKEN=123:ABC CHAT_ID=987654321 SERVER_NAME="My VPS" bash
 ```
 
 ### Uninstall
