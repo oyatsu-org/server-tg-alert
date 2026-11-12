@@ -5,7 +5,7 @@
 #  Install:    curl -fsSL https://raw.githubusercontent.com/oyatsu-org/server-tg-alert/main/tg-alert.sh | sudo bash
 #  Uninstall:  curl -fsSL https://raw.githubusercontent.com/oyatsu-org/server-tg-alert/main/tg-alert.sh | sudo bash -s uninstall
 #  Non-interactive:
-#     curl -fsSL https://raw.githubusercontent.com/oyatsu-org/server-tg-alert/main/tg-alert.sh | sudo BOT_TOKEN=xxx CHAT_ID=yyy SERVER_NAME="My VPS" bash
+#     curl -fsSL https://raw.githubusercontent.com/oyatsu-org/server-tg-alert/main/tg-alert.sh | sudo BOT_TOKEN=xxx CHAT_ID=yyy SERVER_NAME="My VPS" ENABLE_USEPAM=yes bash
 #
 #  Alerts: server start / shutdown / reboot / unclean shutdown,
 #          successful SSH + console login, failed SSH logins.
@@ -382,6 +382,100 @@ EOF
 # =====================================================================
 PAM_LINE="session optional pam_exec.so quiet /usr/local/bin/tg-alert-login"
 
+# value of an sshd setting from "sshd -T" output:  sshd_opt "$output" usepam
+sshd_opt() { awk -v k="$2" 'tolower($1)==k {print tolower($2); exit}' <<<"$1"; }
+
+sshd_dump() {
+    # sshd -T fails on socket-activated systems (Ubuntu 24.04+) if this dir is missing
+    [ -d /run/sshd ] || mkdir -p -m 0755 /run/sshd
+    sshd -T 2>&1
+}
+
+check_usepam() {
+    command -v sshd >/dev/null || return 0
+    local out cur ans="n"
+    if ! out=$(sshd_dump); then
+        c_warn "Could not check the SSH server config: $(head -1 <<<"$out")"
+        return 0
+    fi
+    cur=$(sshd_opt "$out" usepam)
+    [ "$cur" = yes ] && return 0
+    if [ -z "$cur" ]; then
+        c_warn "This SSH server was built without PAM support - SSH login alerts will not work."
+        return 0
+    fi
+
+    echo
+    c_warn "SSH login alerts need 'UsePAM yes' in the SSH server config, but it is turned off."
+    if [ -n "${ENABLE_USEPAM:-}" ]; then
+        ans=$ENABLE_USEPAM
+    elif [ -r /dev/tty ]; then
+        ask ans "Turn it on now? Your current SSH session stays connected. [Y/n] "
+        ans=${ans:-y}
+    fi
+    if [[ ! $ans =~ ^[Yy] ]]; then
+        c_warn "Skipped - SSH login alerts will not work. (Run the installer again to enable it later.)"
+        return 0
+    fi
+    enable_usepam "$out"
+}
+
+enable_usepam() {
+    local before=$1 cfg=${SSHD_CONFIG:-/etc/ssh/sshd_config} ts f out kbd_key kbd pw
+    local files=("$cfg")
+    ts=$(date +%Y%m%d-%H%M%S)
+    for f in "$cfg.d"/*.conf; do [ -f "$f" ] && files+=("$f"); done
+
+    for f in "${files[@]}"; do cp -a "$f" "$f.tg-alert-$ts.bak"; done
+    restore() {
+        for f in "${files[@]}"; do cp -a "$f.tg-alert-$ts.bak" "$f"; rm -f "$f.tg-alert-$ts.bak"; done
+    }
+
+    # 1) change any "UsePAM no" to "UsePAM yes"
+    for f in "${files[@]}"; do
+        sed -i -E 's/^([[:space:]]*)usepam[[:space:]]+no([[:space:]]|$).*/\1UsePAM yes/I' "$f"
+    done
+    # 2) still off (no line at all)? add it at the top of sshd_config
+    out=$(sshd_dump || true)
+    if [ "$(sshd_opt "$out" usepam)" != yes ]; then
+        { printf '# Added by tg-alert (Telegram login alerts)\nUsePAM yes\n\n'; cat "$cfg"; } > "$cfg.tg-alert.tmp"
+        cat "$cfg.tg-alert.tmp" > "$cfg"; rm -f "$cfg.tg-alert.tmp"
+        out=$(sshd_dump || true)
+    fi
+    # 3) safety: with PAM on, keyboard-interactive auth could allow password logins.
+    #    If password login was off before, make sure it stays off.
+    pw=$(sshd_opt "$before" passwordauthentication)
+    kbd_key=kbdinteractiveauthentication
+    kbd=$(sshd_opt "$out" $kbd_key)
+    if [ -z "$kbd" ]; then kbd_key=challengeresponseauthentication; kbd=$(sshd_opt "$out" $kbd_key); fi
+    if [ "$pw" = no ] && [ "$kbd" = yes ]; then
+        local kw=KbdInteractiveAuthentication
+        [ "$kbd_key" = challengeresponseauthentication ] && kw=ChallengeResponseAuthentication
+        { printf '# Added by tg-alert: keep password logins disabled\n%s no\n' "$kw"; cat "$cfg"; } > "$cfg.tg-alert.tmp"
+        cat "$cfg.tg-alert.tmp" > "$cfg"; rm -f "$cfg.tg-alert.tmp"
+    fi
+
+    # 4) validate, or roll back
+    if ! sshd -t 2>/dev/null || [ "$(sshd_opt "$(sshd_dump)" usepam)" != yes ]; then
+        restore
+        c_err "Could not enable UsePAM safely - SSH config restored, nothing changed."
+        return 0
+    fi
+
+    # keep backups only of files that actually changed
+    for f in "${files[@]}"; do
+        cmp -s "$f" "$f.tg-alert-$ts.bak" && rm -f "$f.tg-alert-$ts.bak"
+    done
+
+    # 5) apply (reload keeps existing connections; socket-activated sshd picks it up on next login)
+    local s
+    for s in ssh sshd; do
+        systemctl is-active -q "$s" 2>/dev/null && systemctl reload "$s" 2>/dev/null || true
+    done
+    c_ok "✔ UsePAM enabled. Backup of the old SSH config:"
+    for f in "${files[@]}"; do [ -f "$f.tg-alert-$ts.bak" ] && echo "    $f.tg-alert-$ts.bak"; done; true
+}
+
 do_install() {
     echo "=== VPS Telegram Alerts installer ==="
 
@@ -429,9 +523,7 @@ do_install() {
             printf '\n# Telegram login alert\n%s\n' "$PAM_LINE" >> "$f"
         fi
     done
-    if command -v sshd >/dev/null && ! sshd -T 2>/dev/null | grep -qi '^usepam yes'; then
-        c_warn "WARNING: 'UsePAM yes' is not active in sshd_config - SSH login alerts will not work."
-    fi
+    check_usepam
 
     systemctl daemon-reload
     systemctl enable tg-alert-power.service tg-alert-failwatch.service >/dev/null 2>&1

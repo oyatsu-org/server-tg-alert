@@ -22,7 +22,7 @@ Don't have a bot yet? In Telegram, open **@BotFather**, send `/newbot`, and copy
 ### Without any questions (for automation)
 Replace the three values with your own. Most people should use the command above instead.
 ```bash
-curl -fsSL https://raw.githubusercontent.com/oyatsu-org/server-tg-alert/main/tg-alert.sh | sudo BOT_TOKEN=123:ABC CHAT_ID=987654321 SERVER_NAME="My VPS" bash
+curl -fsSL https://raw.githubusercontent.com/oyatsu-org/server-tg-alert/main/tg-alert.sh | sudo BOT_TOKEN=123:ABC CHAT_ID=987654321 SERVER_NAME="My VPS" ENABLE_USEPAM=yes bash
 ```
 
 ### Uninstall
@@ -45,4 +45,6 @@ Test: `tg-alert-send "hello"`. Logs: `journalctl -u tg-alert-failwatch -u tg-ale
 ## Notes
 - Needs a systemd-based Linux (Ubuntu, Debian, CentOS/Rocky/Alma, …).
 - A sudden power cut can't send a shutdown message. You get the ⚠️ warning at the next boot instead.
-- SSH login alerts need `UsePAM yes` in sshd_config (the default on most distros).
+- SSH login alerts need `UsePAM yes` in the SSH config (the default on most distros). If it's off, the
+  installer asks whether to turn it on. It keeps a backup, keeps password logins off if they were off,
+  and undoes the change if the new config doesn't pass `sshd -t`.
