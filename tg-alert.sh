@@ -31,6 +31,24 @@ ask() {  # ask VAR "prompt"
     printf -v "$1" '%s' "$__v"
 }
 
+# Like ask, but shows * for each character (for the bot token).
+ask_secret() {  # ask_secret VAR "prompt"
+    [ -r /dev/tty ] || die "no terminal available - pass BOT_TOKEN=... CHAT_ID=... as environment variables"
+    local __v="" __c
+    printf '%s' "$2" >/dev/tty
+    while IFS= read -rsn1 __c </dev/tty; do
+        case "$__c" in
+            ""|$'\n'|$'\r') break ;;
+            $'\x7f'|$'\b') if [ -n "$__v" ]; then __v="${__v%?}"; printf '\b \b' >/dev/tty; fi ;;
+            *) __v+="$__c"; printf '*' >/dev/tty ;;
+        esac
+    done
+    echo >/dev/tty
+    # drop terminal "bracketed paste" markers if the terminal added them
+    __v="${__v//$'\e[200~'/}"; __v="${__v//$'\e[201~'/}"
+    printf -v "$1" '%s' "$__v"
+}
+
 [ "$(id -u)" -eq 0 ] || die "please run as root (use: ... | sudo bash)"
 command -v systemctl >/dev/null && command -v journalctl >/dev/null || die "systemd is required"
 
@@ -252,7 +270,7 @@ get_token() {
             echo
             echo "1) In Telegram, open @BotFather and send /newbot"
             echo "2) Copy the token it gives you (looks like 123456789:AAH...)"
-            ask BOT_TOKEN "Bot token: "
+            ask_secret BOT_TOKEN "Bot token: "
         fi
         BOT_TOKEN="$(echo "$BOT_TOKEN" | tr -d '[:space:]')"
         if [[ ! $BOT_TOKEN =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then
